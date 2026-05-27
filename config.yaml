@@ -1,0 +1,94 @@
+# Nexus Monitor Configuration
+# Lightweight health monitoring for the Tech Duinn swarm
+
+server:
+  host: "0.0.0.0"
+  port: 8099
+  poll_interval: "30s"
+
+# Swarm services to monitor
+services:
+  - name: ollama
+    host: dagda
+    port: 11434
+    type: http
+    path: "/"
+    timeout: "5s"
+    node: dagda
+
+  - name: litellm
+    host: dagda
+    port: 4000
+    type: http
+    path: "/health"
+    timeout: "5s"
+    node: dagda
+
+  - name: jellyfin
+    host: brigid
+    port: 8097
+    type: http
+    path: "/health"
+    timeout: "5s"
+    node: brigid
+
+  - name: pihole
+    host: cernunnos
+    port: 80
+    type: http
+    path: "/admin/"
+    timeout: "10s"
+    node: cernunnos
+
+  - name: redis
+    host: dagda
+    port: 6379
+    type: tcp
+    timeout: "3s"
+    node: dagda
+
+  - name: chroma
+    host: dagda
+    port: 8002
+    type: http
+    path: "/api/v1/heartbeat"
+    timeout: "5s"
+    node: dagda
+
+  - name: engram
+    host: dagda
+    port: 7437
+    type: http
+    path: "/health"
+    timeout: "5s"
+    node: dagda
+
+  - name: mqtt
+    host: dagda
+    port: 1883
+    type: tcp
+    timeout: "3s"
+    node: dagda
+
+# Kubernetes monitoring
+k8s:
+  enabled: true
+  interval: "30s"
+
+# Alert configuration
+alerts:
+  enabled: true
+  threshold: 2  # consecutive failures before alerting
+  mqtt:
+    enabled: true
+    broker: "dagda"
+    port: 1883
+    topic: "nexus/alerts"
+    client_id: "nexus-monitor"
+  webhook:
+    enabled: false
+    # url: "https://hooks.example.com/alerts"
+
+# History retention
+history:
+  max_age: "24h"
