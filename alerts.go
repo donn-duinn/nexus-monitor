@@ -7,7 +7,10 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"sync"
 	"time"
+
+	mqtt "github.com/eclipse/paho.mqtt.golang"
 )
 
 // Alert represents an active or resolved alert.
@@ -22,22 +25,40 @@ type Alert struct {
 
 // AlertSystem manages alerts and notifications.
 type AlertSystem struct {
-	cfg       *Config
-	monitor   *Monitor
-	alerts    []Alert
-	alerted   map[string]bool // service -> whether we've alerted for current outage
+	cfg        *Config
+	monitor    *Monitor
+	mu         sync.RWMutex
+	alerts     []Alert
+	alerted    map[string]bool // service -> whether we've alerted for current outage
 	httpClient *http.Client
+	mqttClient mqtt.Client
 }
 
 // NewAlertSystem creates a new alert system.
 func NewAlertSystem(cfg *Config, monitor *Monitor) *AlertSystem {
-	return &AlertSystem{
+	a := &AlertSystem{
 		cfg:        cfg,
 		monitor:    monitor,
 		alerts:     make([]Alert, 0, 100),
 		alerted:    make(map[string]bool),
 		httpClient: &http.Client{Timeout: 10 * time.Second},
 	}
+
+	// Initialize MQTT client if enabled.
+	if cfg.Alerts.MQTT.Enabled {
+		broker := fmt.Sprintf("tcp://%s:%d", cfg.Alerts.MQTT.Broker, cfg.Alerts.MQTT.Port)
+		opts := mqtt.NewClientOptions().
+			AddBroker(broker).
+			SetClientID(cfg.Alerts.MQTT.ClientID).
+			SetAutoReconnect(true).
+			SetConnectTimeout(10 * time.Second)
+		a.mqttClient = mqtt.NewClient(opts)
+		if token := a.mqttClient.Connect(); token.Wait() && token.Error() != nil {
+			log.Printf("[alerts] MQTT client connect failed: %v", token.Error())
+		}
+	}
+
+	return a
 }
 
 // Start begins the alert checking loop.
@@ -67,16 +88,24 @@ func (a *AlertSystem) checkAlerts() {
 	for _, svc := range a.cfg.Services {
 		failCount := a.monitor.GetFailCount(svc.Name)
 
+		a.mu.RLock()
+		alreadyAlerted := a.alerted[svc.Name]
+		a.mu.RUnlock()
+
 		// Service just went down (reached threshold).
-		if failCount == a.cfg.Alerts.Threshold && !a.alerted[svc.Name] {
+		if failCount >= a.cfg.Alerts.Threshold && !alreadyAlerted {
 			a.fireAlert(svc.Name, "down", fmt.Sprintf("Service %s is DOWN after %d consecutive failures", svc.Name, failCount))
+			a.mu.Lock()
 			a.alerted[svc.Name] = true
+			a.mu.Unlock()
 		}
 
 		// Service recovered.
-		if a.monitor.IsNewlyRecovered(svc.Name) && a.alerted[svc.Name] {
+		if a.monitor.IsNewlyRecovered(svc.Name) && alreadyAlerted {
 			a.fireAlert(svc.Name, "recovered", fmt.Sprintf("Service %s has RECOVERED", svc.Name))
+			a.mu.Lock()
 			a.alerted[svc.Name] = false
+			a.mu.Unlock()
 		}
 	}
 }
@@ -92,7 +121,9 @@ func (a *AlertSystem) fireAlert(service, alertType, message string) {
 		Resolved:  alertType == "recovered",
 	}
 
+	a.mu.Lock()
 	a.alerts = append(a.alerts, alert)
+	a.mu.Unlock()
 	log.Printf("[alert] %s", message)
 
 	// Publish to MQTT.
@@ -108,31 +139,23 @@ func (a *AlertSystem) fireAlert(service, alertType, message string) {
 
 // publishMQTT publishes an alert to the MQTT broker.
 func (a *AlertSystem) publishMQTT(alert Alert) {
+	if a.mqttClient == nil || !a.mqttClient.IsConnected() {
+		log.Printf("[alerts] MQTT client not connected, skipping publish")
+		return
+	}
+
 	payload, err := json.Marshal(alert)
 	if err != nil {
 		log.Printf("[alerts] failed to marshal MQTT alert: %v", err)
 		return
 	}
 
-	// Use HTTP publish endpoint or direct MQTT.
-	// For simplicity, we use a lightweight HTTP-to-MQTT approach.
-	// In production, use a proper MQTT client library.
-	addr := fmt.Sprintf("http://%s:%d/mqtt/publish", a.cfg.Alerts.MQTT.Broker, a.cfg.Alerts.MQTT.Port+1000)
-	req, err := http.NewRequest("POST", addr, bytes.NewReader(payload))
-	if err != nil {
-		log.Printf("[alerts] MQTT publish request error: %v", err)
+	token := a.mqttClient.Publish(a.cfg.Alerts.MQTT.Topic, 1, false, payload)
+	token.Wait()
+	if token.Error() != nil {
+		log.Printf("[alerts] MQTT publish failed: %v", token.Error())
 		return
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Topic", a.cfg.Alerts.MQTT.Topic)
-
-	resp, err := a.httpClient.Do(req)
-	if err != nil {
-		// Fallback: log the alert if MQTT is unreachable.
-		log.Printf("[alerts] MQTT publish failed (will retry on next check): %v", err)
-		return
-	}
-	defer resp.Body.Close()
 	log.Printf("[alerts] MQTT alert published to %s", a.cfg.Alerts.MQTT.Topic)
 }
 
@@ -153,10 +176,22 @@ func (a *AlertSystem) sendWebhook(alert Alert) {
 	log.Printf("[alerts] webhook alert sent to %s", a.cfg.Alerts.Webhook.URL)
 }
 
+// Disconnect cleanly shuts down the MQTT client.
+func (a *AlertSystem) Disconnect() {
+	if a.mqttClient != nil && a.mqttClient.IsConnected() {
+		a.mqttClient.Disconnect(1000)
+	}
+}
+
 // GetAlerts returns all alerts, optionally filtered to active only.
 func (a *AlertSystem) GetAlerts(activeOnly bool) []Alert {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
 	if !activeOnly {
-		return a.alerts
+		result := make([]Alert, len(a.alerts))
+		copy(result, a.alerts)
+		return result
 	}
 
 	result := make([]Alert, 0)

@@ -190,9 +190,15 @@ func (m *Monitor) checkService(svc ServiceConfig) {
 func (m *Monitor) checkHTTP(svc ServiceConfig, timeout time.Duration) (string, time.Duration, string) {
 	url := fmt.Sprintf("http://%s:%d%s", svc.Host, svc.Port, svc.Path)
 
-	client := &http.Client{Timeout: timeout}
+	// Use per-check timeout via context to leverage the shared m.client.
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return "down", 0, fmt.Sprintf("request build failed: %v", err)
+	}
 	start := time.Now()
-	resp, err := client.Get(url)
+	resp, err := m.client.Do(req)
 	latency := time.Since(start)
 
 	if err != nil {
@@ -372,7 +378,14 @@ func (m *Monitor) addHistory(service, status string, latency time.Duration, msg 
 		i++
 	}
 	if i > 0 {
-		m.history = m.history[i:]
+		if i > len(m.history)/2 {
+			// Copy to a new slice to release the old backing array.
+			newHistory := make([]CheckResult, len(m.history)-i)
+			copy(newHistory, m.history[i:])
+			m.history = newHistory
+		} else {
+			m.history = m.history[i:]
+		}
 	}
 	m.mu.Unlock()
 }

@@ -74,6 +74,7 @@ func main() {
 
 	<-done
 	log.Println("[shutdown] received signal, shutting down gracefully...")
+	alerts.Disconnect()
 	cancel()
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
